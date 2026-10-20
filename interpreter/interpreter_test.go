@@ -105,6 +105,51 @@ func TestInferenceHeyJarvis(t *testing.T) {
 	}
 }
 
+// TestMatchesTFLite checks that streaming inference reproduces TFLite's
+// reference kernels exactly. hey_jarvis_tflite_outputs.bin holds one uint8
+// output per invocation, produced by ai-edge-litert's Interpreter (with
+// OpResolverType.BUILTIN_REF) on hey_jarvis_features.bin, three frames at a
+// time. Off-by-one rounding in any kernel compounds through the streaming
+// state and shows up here.
+func TestMatchesTFLite(t *testing.T) {
+	want, err := os.ReadFile(filepath.Join(testRoot(), "testdata", "hey_jarvis_tflite_outputs.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := model.LoadFile(testModelPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := loadFeatures(testFeaturesPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	interp, err := New(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const stride = 3
+	if got := len(frames) / stride; got != len(want) {
+		t.Fatalf("%d invocations, want %d", got, len(want))
+	}
+	input := make([]int8, 0, stride*len(frames[0]))
+	for i, w := range want {
+		input = input[:0]
+		for _, f := range frames[i*stride : (i+1)*stride] {
+			input = append(input, f...)
+		}
+		if err := interp.SetInput(input); err != nil {
+			t.Fatal(err)
+		}
+		if err := interp.Invoke(); err != nil {
+			t.Fatal(err)
+		}
+		if got := interp.OutputUint8()[0]; got != w {
+			t.Errorf("invocation %d: output %d, TFLite %d", i, got, w)
+		}
+	}
+}
+
 func TestInferenceOkayNabu(t *testing.T) {
 	modelPath := filepath.Join(testRoot(), "testdata", "okay_nabu.tflite")
 	if _, err := os.Stat(modelPath); err != nil {
