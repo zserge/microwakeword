@@ -2,6 +2,7 @@ package audiofrontend
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,17 +19,26 @@ func loadWAV(path string) ([]int16, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Skip 44-byte WAV header
-	if len(data) < 44 {
-		return nil, err
+	// Walk the RIFF chunks to the "data" chunk: hey_jarvis.wav carries a LIST
+	// chunk, so its samples do not start at byte 44.
+	if len(data) < 12 || string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+		return nil, fmt.Errorf("%s: not a RIFF/WAVE file", path)
 	}
-	pcm := data[44:]
-	n := len(pcm) / 2
-	samples := make([]int16, n)
-	for i := 0; i < n; i++ {
-		samples[i] = int16(binary.LittleEndian.Uint16(pcm[i*2:]))
+	for off := 12; off+8 <= len(data); {
+		id := string(data[off : off+4])
+		size := int(binary.LittleEndian.Uint32(data[off+4:]))
+		body := data[off+8:]
+		if id == "data" {
+			pcm := body[:min(size, len(body))]
+			samples := make([]int16, len(pcm)/2)
+			for i := range samples {
+				samples[i] = int16(binary.LittleEndian.Uint16(pcm[i*2:]))
+			}
+			return samples, nil
+		}
+		off += 8 + size + size&1
 	}
-	return samples, nil
+	return nil, fmt.Errorf("%s: no data chunk", path)
 }
 
 func loadGoldenFeatures(path string) ([][]int8, error) {
@@ -74,43 +84,40 @@ func TestFrontendVsGolden(t *testing.T) {
 	fe := New(cfg)
 	goFrames := fe.ProcessAllInt8(samples)
 
-	t.Logf("Go frames: %d, Golden frames: %d", len(goFrames), len(golden))
-
-	// Compare frame counts (allow small difference due to edge handling)
-	minFrames := len(golden)
-	if len(goFrames) < minFrames {
-		minFrames = len(goFrames)
+	// The frontend is a bit-exact port of the TFLite Micro microfrontend as
+	// built by pymicro-features against glibc, so the features must match the
+	// golden file exactly, frame for frame, with one documented exception.
+	//
+	// The golden file was made with a libm whose log1pf is correctly rounded;
+	// glibc's log1pf (which the reference, and so this port, uses) is one ulp
+	// off for some filterbank bins, which moves two Q12 filterbank weights by
+	// one (2470/1626 -> 2471/1625 and 1400/2696 -> 1401/2695). On this clip
+	// that changes one uint16 feature, 418 -> 417 at frame 487 channel 33,
+	// which quantizes to 32 instead of the golden 33.
+	type at struct{ frame, channel int }
+	known := map[at]int8{{487, 33}: 32}
+	if len(goFrames) != len(golden) {
+		t.Fatalf("frame count: got %d, golden %d", len(goFrames), len(golden))
 	}
-	if minFrames == 0 {
-		t.Fatal("No frames produced")
-	}
-
-	// Compute per-frame mean absolute error
-	totalMAE := 0.0
-	maxDiff := 0
-	for i := 0; i < minFrames; i++ {
-		frameMAE := 0.0
-		for j := 0; j < 40; j++ {
-			diff := int(goFrames[i][j]) - int(golden[i][j])
-			if diff < 0 {
-				diff = -diff
-			}
-			if diff > maxDiff {
-				maxDiff = diff
-			}
-			frameMAE += float64(diff)
+	mismatches := 0
+	for i := range golden {
+		if len(goFrames[i]) != len(golden[i]) {
+			t.Fatalf("frame %d: got %d features, golden %d", i, len(goFrames[i]), len(golden[i]))
 		}
-		frameMAE /= 40.0
-		totalMAE += frameMAE
+		for j := range golden[i] {
+			want := golden[i][j]
+			if v, ok := known[at{i, j}]; ok {
+				want = v
+			}
+			if goFrames[i][j] != want {
+				if mismatches < 10 {
+					t.Errorf("frame %d channel %d: got %d, want %d (golden %d)", i, j, goFrames[i][j], want, golden[i][j])
+				}
+				mismatches++
+			}
+		}
 	}
-	totalMAE /= float64(minFrames)
-
-	t.Logf("Mean absolute error: %.2f, Max diff: %d", totalMAE, maxDiff)
-
-	// The Go frontend is a float64 approximation of the fixed-point C version.
-	// Allow reasonable tolerance — exact matching isn't needed as long as
-	// the downstream model still detects correctly.
-	if totalMAE > 25 {
-		t.Errorf("MAE too high: %.2f (want < 25)", totalMAE)
+	if mismatches > 0 {
+		t.Fatalf("%d features differ from the reference", mismatches)
 	}
 }
